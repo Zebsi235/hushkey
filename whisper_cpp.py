@@ -110,6 +110,19 @@ hausa=ha bashkir=ba javanese=jw sundanese=su cantonese=yue
 '''.split())
 
 
+# whisper.cpp works in 30 s windows. A recording just over a boundary
+# (30.13 s, say) leaves a last window of a fraction of a second, padded with
+# silence to 30 s, and the model fills it with invented text such as
+# '… es heilt die göttliche Kraft!' — timestamped 30.0-59.98, i.e. ending
+# far past the audio. Real speech cannot end after the recording does;
+# the slack covers whisper.cpp's coarse segment timestamps.
+OVERRUN_SLACK = 1.0
+
+
+def _within_audio(segment_end, duration):
+    return segment_end <= duration + OVERRUN_SLACK
+
+
 def _http(request, timeout):
     # Never send dictation through HTTP_PROXY, even if NO_PROXY is misconfigured.
     return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
@@ -288,7 +301,8 @@ class WhisperCppModel:
             if 'segments' not in result or not isinstance(result['segments'], list):
                 raise RuntimeError('Invalid whisper.cpp response; use the version from setup_vulkan.py')
             segments = [SimpleNamespace(text=s['text'], start=s['start'], end=s['end'])
-                        for s in result['segments']]
+                        for s in result['segments']
+                        if _within_audio(s['end'], len(audio) / 16000)]
             detected = result.get('language', language)
             code = _LANGUAGES.get(str(detected).replace(' ', '_'), detected)
             return segments, SimpleNamespace(language=code, duration=duration)
