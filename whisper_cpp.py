@@ -115,7 +115,10 @@ hausa=ha bashkir=ba javanese=jw sundanese=su cantonese=yue
 # silence to 30 s, and the model fills it with invented text such as
 # '… es heilt die göttliche Kraft!' — timestamped 30.0-59.98, i.e. ending
 # far past the audio. Real speech cannot end after the recording does;
-# the slack covers whisper.cpp's coarse segment timestamps.
+# the slack covers whisper.cpp's coarse segment timestamps. Real speech in a
+# short last window comes back clamped to the audio end (seen at 31.0, 60.16
+# and 90.2 s), not to the padded window end. A segment is dropped whole, so a
+# real word whisper.cpp merged into the invented text would go with it.
 OVERRUN_SLACK = 1.0
 
 
