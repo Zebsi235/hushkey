@@ -321,3 +321,50 @@ def test_pythonw_supervisor_uses_a_working_stdin_pipe(tmp_path):
     proc.stdout.close()
     proc.stderr.close()
     assert 'Exception' not in error and 'Traceback' not in error
+
+
+def _fake_server(monkeypatch, segments):
+    import whisper_cpp
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    payload = json.dumps({'language': 'german', 'segments': segments}).encode()
+    monkeypatch.setattr(whisper_cpp, '_http', lambda request, timeout: Response(payload))
+
+
+def test_drops_text_invented_for_a_nearly_empty_last_window(monkeypatch):
+    """Regression (debug recording, v0.10.3): a 30.13 s dictation left whisper.cpp
+    a second 30 s window holding 0.13 s of near-silence, which came back as
+    ' Vertraue und glaube, es hilft, es heilt die göttliche Kraft!' (30.0-59.98)."""
+    import faster_whisper.vad
+    rate = 16000
+    audio = np.zeros(int(30.13 * rate), dtype=np.float32)
+    audio[:int(28.3 * rate)] = 0.1                        # speech
+    audio[int(28.3 * rate):int(29.5 * rate)] = 0.02       # breath / room noise
+    monkeypatch.setattr(faster_whisper.vad, 'get_speech_timestamps',
+                        lambda a: [{'start': int(1.74 * rate), 'end': len(a)}])
+    _fake_server(monkeypatch, [
+        {'text': ' Das ist kein Problem.', 'start': 0.0, 'end': 16.26},
+        {'text': ' Das könnte man sich überlegen.', 'start': 16.92, 'end': 28.3},
+        {'text': ' Vertraue und glaube, es hilft, es heilt die göttliche Kraft!',
+         'start': 30.0, 'end': 59.98},
+    ])
+    segments, _info = client(('http://unused', [])).transcribe(audio, language=None)
+    assert [s.text for s in segments] == [' Das ist kein Problem.',
+                                          ' Das könnte man sich überlegen.']
+
+
+def test_keeps_a_quiet_short_final_word(monkeypatch):
+    """The same debug session: a soft ' Genau.' got only 98.7-98.9 s from
+    whisper.cpp — short and quiet, but real, and inside the recording."""
+    _fake_server(monkeypatch, [{'text': ' Also es halt nicht ging.', 'start': 82.06, 'end': 97.16},
+                               {'text': ' Genau.', 'start': 98.7, 'end': 98.9}])
+    audio = np.full(int(99.42 * 16000), 0.004, dtype=np.float32)
+    segments, _info = client(('http://unused', [])).transcribe(
+        audio, language='de', vad_filter=False)
+    assert [s.text for s in segments] == [' Also es halt nicht ging.', ' Genau.']
