@@ -282,8 +282,7 @@ def copy_to_clipboard(text):
     if sys.platform == "win32":
         dictate._win_clipboard_write(text)
     elif sys.platform == "darwin":
-        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True,
-                       timeout=5)
+        dictate._mac_clipboard_write(text)  # pins a UTF-8 locale
     elif os.environ.get("WAYLAND_DISPLAY"):
         # wl-copy forks a background owner and returns right away
         subprocess.run(["wl-copy", "--type", "text/plain"],
