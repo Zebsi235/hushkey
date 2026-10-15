@@ -2174,3 +2174,92 @@ def test_transcript_is_recorded_even_when_insert_fails(monkeypatch, tmp_path):
     wav.write_bytes(b"")
     d._transcribe_and_insert(str(wav), 1.0)
     assert [e["text"] for e in dictate.read_history()] == ["lost words"]
+
+
+FLAT = ("man muss dazu sagen dass ich gestern auch noch den agx tor von nvidia "
+        "geschnappt habe weil da ein paar rumliegen und ich habe gefragt ob ich "
+        "den probieren kann")
+
+
+def test_transcribe_redecodes_long_text_without_punctuation(monkeypatch, tmp_path):
+    """Regression (debug recording, v0.10.4): on a 189 s German dictation
+    whisper.cpp returned every word lowercase without a single punctuation
+    mark, deterministically. A punctuated prompt in the detected language
+    restores the style; the re-decode is pinned to that language."""
+    d, rec, wav = make_daemon(monkeypatch, tmp_path)
+    calls = []
+
+    class FakeModel:
+        def transcribe(self, source, **kw):
+            calls.append(kw)
+            text = FLAT if len(calls) == 1 else "Man muss dazu sagen, dass ich es weiß."
+            return [type("Seg", (), {"text": text})()], type("Info", (), {"language": "de"})()
+
+    d.model = FakeModel()
+    segs = d._transcribe(wav, None)
+    assert [s.text for s in segs] == ["Man muss dazu sagen, dass ich es weiß."]
+    assert len(calls) == 2
+    assert calls[1]["language"] == "de"
+    assert calls[1]["initial_prompt"] == dictate.STYLE_PROMPTS["de"]
+
+
+def test_transcribe_keeps_short_or_punctuated_text_in_one_pass(monkeypatch, tmp_path):
+    d, rec, wav = make_daemon(monkeypatch, tmp_path)
+    calls = []
+    texts = iter(["ja genau", FLAT.capitalize() + "."])
+
+    class FakeModel:
+        def transcribe(self, source, **kw):
+            calls.append(kw)
+            return [type("Seg", (), {"text": next(texts)})()], type("Info", (), {"language": "de"})()
+
+    d.model = FakeModel()
+    d._transcribe(wav, None)
+    d._transcribe(wav, None)
+    assert len(calls) == 2  # no re-decode for either
+
+
+def test_transcribe_keeps_first_pass_when_redecode_is_no_better(monkeypatch, tmp_path):
+    d, rec, wav = make_daemon(monkeypatch, tmp_path)
+    calls = []
+
+    class FakeModel:
+        def transcribe(self, source, **kw):
+            calls.append(kw)
+            text = FLAT if len(calls) == 1 else "x"
+            return [type("Seg", (), {"text": text})()], type("Info", (), {"language": "de"})()
+
+    d.model = FakeModel()
+    segs = d._transcribe(wav, None)
+    assert [s.text for s in segs] == [FLAT]
+
+
+def test_transcribe_style_redecode_uses_pinned_language(monkeypatch, tmp_path):
+    d, rec, wav = make_daemon(monkeypatch, tmp_path)
+    calls = []
+
+    class FakeModel:
+        def transcribe(self, source, **kw):
+            calls.append(kw)
+            text = FLAT if len(calls) == 1 else "Fine, thanks."
+            return [type("Seg", (), {"text": text})()], None
+
+    d.model = FakeModel()
+    d._transcribe(wav, "en")
+    assert calls[1]["language"] == "en"
+    assert calls[1]["initial_prompt"] == dictate.STYLE_PROMPTS["en"]
+
+
+def test_preview_skips_the_punctuation_redecode(monkeypatch, tmp_path):
+    """The preview holds busy_lock; a second pass would delay the final one."""
+    d, rec, wav = make_daemon(monkeypatch, tmp_path)
+    calls = []
+
+    class FakeModel:
+        def transcribe(self, source, **kw):
+            calls.append(kw)
+            return [type("Seg", (), {"text": FLAT})()], type("Info", (), {"language": "de"})()
+
+    d.model = FakeModel()
+    d._transcribe(wav, None, restyle=False)
+    assert len(calls) == 1
