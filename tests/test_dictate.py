@@ -2174,3 +2174,123 @@ def test_transcript_is_recorded_even_when_insert_fails(monkeypatch, tmp_path):
     wav.write_bytes(b"")
     d._transcribe_and_insert(str(wav), 1.0)
     assert [e["text"] for e in dictate.read_history()] == ["lost words"]
+
+
+def _paste_mode(monkeypatch, platform, previous="OLD", terminal=False):
+    """Paste mode on `platform` with a stubbed clipboard; returns the writes."""
+    monkeypatch.setenv("PTT_INSERT", "paste")
+    monkeypatch.setattr(sys, "platform", platform)
+    writes = []
+    monkeypatch.setattr(dictate.PynputInjector, "_clipboard_read",
+                        staticmethod(lambda: previous))
+    monkeypatch.setattr(dictate.PynputInjector, "_clipboard_write",
+                        staticmethod(lambda data, transient=False:
+                                     writes.append((data, transient))))
+    monkeypatch.setattr(dictate, "foreground_window_is_terminal",
+                        lambda: terminal)
+    monkeypatch.setattr(dictate, "_CHORD_KEYS",
+                        {"ctrl": "<ctrl>", "shift": "<shift>",
+                         "insert": "<insert>", "cmd": "<cmd>"})
+    monkeypatch.setattr(dictate.time, "sleep", lambda s: None)
+    injector = dictate.PynputInjector()
+    injector.controller = FakeController()
+    return injector, writes
+
+
+def _downs(injector):
+    return [k for event, k in injector.controller.events if event == "down"]
+
+
+def test_paste_mode_pastes_with_ctrl_v_and_restores_the_clipboard(monkeypatch):
+    """Default mode: the whole dictation goes in as one paste, not one
+    keystroke per character (3,000 chars took 15+ s to type)."""
+    injector, writes = _paste_mode(monkeypatch, "win32")
+    injector.insert("Hallo, Welt! ")
+    assert _downs(injector) == ["<ctrl>", "v"]
+    assert writes == [("Hallo, Welt! ", True), ("OLD", False)]
+
+
+def test_paste_mode_uses_shift_insert_in_windows_terminals(monkeypatch):
+    """mintty (Git Bash) does not paste on Ctrl+V; every Windows terminal
+    takes Shift+Insert."""
+    injector, _writes = _paste_mode(monkeypatch, "win32", terminal=True)
+    injector.insert("ls -la")
+    assert _downs(injector) == ["<shift>", "<insert>"]
+
+
+def test_paste_mode_uses_cmd_v_on_macos(monkeypatch):
+    injector, _writes = _paste_mode(monkeypatch, "darwin")
+    injector.insert("Hallo")
+    assert _downs(injector) == ["<cmd>", "v"]
+
+
+def test_paste_mode_uses_ctrl_shift_v_in_linux_terminals(monkeypatch):
+    injector, _writes = _paste_mode(monkeypatch, "linux", terminal=True)
+    injector.insert("Hallo")
+    assert _downs(injector) == ["<ctrl>", "<shift>", "v"]
+
+
+def test_paste_mode_leaves_the_transcript_when_nothing_to_restore(monkeypatch):
+    """An image on the clipboard cannot be restored — the transcript stays."""
+    injector, writes = _paste_mode(monkeypatch, "win32", previous=None)
+    injector.insert("Hallo")
+    assert writes == [("Hallo", False)]
+
+
+def test_paste_mode_honours_the_streaming_chord_override(monkeypatch):
+    injector, _writes = _paste_mode(monkeypatch, "win32")
+    injector.insert("Hallo", chord="shift+insert")
+    assert _downs(injector) == ["<shift>", "<insert>"]
+
+
+def test_paste_mode_falls_back_to_typing_without_a_clipboard(monkeypatch):
+    injector, _writes = _paste_mode(monkeypatch, "win32")
+
+    def broken():
+        raise OSError("the clipboard is busy")
+
+    monkeypatch.setattr(dictate.PynputInjector, "_clipboard_read",
+                        staticmethod(broken))
+    monkeypatch.setattr(dictate, "TYPE_DELAY", 0)
+    injector.insert("ab")
+    assert _downs(injector) == ["a", "b"]
+
+
+def test_insert_mode_config(monkeypatch, tmp_path):
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr(dictate, "CONFIG_PATH", str(cfg))
+    monkeypatch.delenv("PTT_INSERT", raising=False)
+    assert dictate.configured_insert_mode() == "paste"  # the default
+    cfg.write_text(json.dumps({"insert": "type"}), encoding="utf-8")
+    assert dictate.configured_insert_mode() == "type"
+    cfg.write_text(json.dumps({"insert": "bogus"}), encoding="utf-8")
+    assert dictate.configured_insert_mode() == "paste"
+    monkeypatch.setenv("PTT_INSERT", "type")
+    assert dictate.configured_insert_mode() == "type"  # env wins
+
+
+def test_keep_clipboard_skips_the_restore(monkeypatch):
+    monkeypatch.setenv("PTT_KEEP_CLIPBOARD", "1")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(dictate, "_win_clipboard_read",
+                        lambda: pytest.fail("must not read"))
+    assert dictate.PynputInjector._clipboard_read() is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows clipboard")
+def test_windows_clipboard_round_trip_is_private_and_exact():
+    """Real clipboard: Unicode survives, and the transcript carries the
+    formats that keep it out of Win+V history and the cloud clipboard."""
+    import ctypes
+    before = dictate._win_clipboard_read()
+    text = "Grüße & 名字 — ok?"
+    try:
+        dictate._win_clipboard_write(text, private=True)
+        assert dictate._win_clipboard_read() == text
+        user32 = ctypes.windll.user32
+        user32.RegisterClipboardFormatW.restype = ctypes.c_uint
+        fmt = user32.RegisterClipboardFormatW("CanIncludeInClipboardHistory")
+        assert user32.IsClipboardFormatAvailable(fmt)
+    finally:
+        if before is not None:
+            dictate._win_clipboard_write(before)

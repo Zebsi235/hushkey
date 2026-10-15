@@ -439,3 +439,32 @@ def test_history_copy_failure_is_reported(monkeypatch):
     monkeypatch.setattr(t, "_notify", lambda *a: notes.append(a))
     t._copy_history("x")
     assert notes[0][0] == tray.S["history_copy_failed_title"]
+
+
+def test_insert_menu_constructs_and_actions_fire(monkeypatch):
+    import pytest
+    if not tray.load_tray_backend():
+        pytest.skip("pystray not installed")
+    t = tray.Tray.__new__(tray.Tray)
+    chosen = []
+    monkeypatch.setattr(t, "_set_insert", chosen.append)
+    items = list(t._insert_menu().items)
+    assert [i.text for i in items] == [label for _, label in tray.insert_modes()]
+    items[1](None)
+    assert chosen == ["type"]
+    monkeypatch.setattr(tray, "current_insert", lambda: "paste")
+    assert [bool(i.checked) for i in items] == [True, False]
+
+
+def test_set_insert_writes_config_without_restart(monkeypatch, tmp_path):
+    monkeypatch.setattr(tray, "CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setattr(tray.dictate, "CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.delenv("PTT_INSERT", raising=False)
+    monkeypatch.setattr(tray, "clear_env_var", lambda name: None)
+    t = tray.Tray.__new__(tray.Tray)
+    updates, restarts = [], []
+    t.icon = type("I", (), {"update_menu": lambda self: updates.append(1)})()
+    t.daemon = type("D", (), {"restart": lambda self: restarts.append(1)})()
+    t._set_insert("type")
+    assert tray.current_insert() == "type"
+    assert updates == [1] and restarts == []

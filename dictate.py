@@ -65,6 +65,11 @@ Config via environment:
                    blocks are transcribed and inserted every few seconds
                    instead of one big paste on release (default: 0)
   PTT_STREAM_INTERVAL  seconds between streaming ticks (default: 3.0)
+  PTT_INSERT       how a dictation enters the focused window: paste
+                   (default: clipboard plus one paste chord, then the previous
+                   clipboard text is restored) or type (one keystroke per
+                   character). Overrides the tray's "Insert method" menu.
+                   Wayland always pastes.
   PTT_KEEP_CLIPBOARD  1 = leave the transcript in the clipboard instead of
                    restoring the previous contents
   PTT_CLIPBOARD_SETTLE  Wayland: seconds to wait before restoring the previous
@@ -264,6 +269,24 @@ def configured_ptt_key():
         return "ctrl_r"
     name = data.get("ptt_key") if isinstance(data, dict) else None
     return name if isinstance(name, str) and name else "ctrl_r"
+
+
+INSERT_MODES = ("paste", "type")
+
+
+def configured_insert_mode():
+    """'paste' (default) or 'type': PTT_INSERT env wins, then the tray's
+    config file. Read per dictation, so a tray change needs no restart."""
+    env = os.environ.get("PTT_INSERT", "").strip().lower()
+    if env in INSERT_MODES:
+        return env
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return "paste"
+    mode = data.get("insert") if isinstance(data, dict) else None
+    return mode if mode in INSERT_MODES else "paste"
 
 
 def _contains_cjk(text):
@@ -476,6 +499,7 @@ try:
         ("shift", getattr(Key, "shift_l", None)),
         ("alt", getattr(Key, "alt_l", None)),
         ("super", getattr(Key, "cmd_l", None)),
+        ("cmd", getattr(Key, "cmd", None)),
         ("insert", getattr(Key, "insert", None)),
         ("caps_lock", getattr(Key, "caps_lock", None)),
     ) if key is not None}
@@ -757,6 +781,117 @@ def _x11_focus_is_terminal():
             d.close()
 
 
+_CF_UNICODETEXT = 13
+
+
+def _win_clipboard_api():
+    import ctypes
+    from ctypes import wintypes
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalLock.argtypes = (wintypes.HGLOBAL,)
+    kernel32.GlobalUnlock.argtypes = (wintypes.HGLOBAL,)
+    kernel32.GlobalFree.argtypes = (wintypes.HGLOBAL,)
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    user32.GetClipboardData.argtypes = (wintypes.UINT,)
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
+    user32.RegisterClipboardFormatW.argtypes = (wintypes.LPCWSTR,)
+    return ctypes, user32, kernel32
+
+
+def _win_open_clipboard(user32):
+    for _ in range(10):  # another app may hold the clipboard for a moment
+        if user32.OpenClipboard(None):
+            return
+        time.sleep(0.05)
+    raise OSError("the clipboard is busy")
+
+
+def _win_clipboard_read():
+    """The clipboard's text, or None when it holds no text (an image, say —
+    which then cannot be restored, so the transcript stays pasteable)."""
+    ctypes, user32, kernel32 = _win_clipboard_api()
+    _win_open_clipboard(user32)
+    try:
+        handle = user32.GetClipboardData(_CF_UNICODETEXT)
+        if not handle:
+            return None
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return None
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def _win_clipboard_write(text, private=False):
+    """Replace the clipboard with `text`. private=True keeps it out of the
+    Win+V clipboard history, the cloud clipboard and clipboard monitors —
+    for dictations passing through on their way into a window."""
+    ctypes, user32, kernel32 = _win_clipboard_api()
+
+    def put(fmt, data):
+        handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+        if not handle:
+            raise OSError("GlobalAlloc failed")
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            kernel32.GlobalFree(handle)
+            raise OSError("GlobalLock failed")
+        ctypes.memmove(ptr, data, len(data))
+        kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(fmt, handle):
+            kernel32.GlobalFree(handle)
+            raise OSError("SetClipboardData failed")
+        # on success the clipboard owns the memory — do not free it
+
+    _win_open_clipboard(user32)
+    try:
+        user32.EmptyClipboard()
+        put(_CF_UNICODETEXT, text.encode("utf-16-le") + bytes(2))
+        if private:
+            zero = (0).to_bytes(4, "little")
+            for name in ("ExcludeClipboardContentFromMonitorProcessing",
+                         "CanIncludeInClipboardHistory",
+                         "CanUploadToCloudClipboard"):
+                fmt = user32.RegisterClipboardFormatW(name)
+                if fmt:
+                    put(fmt, zero)
+    finally:
+        user32.CloseClipboard()
+
+
+def _mac_clipboard_read():
+    """pbpaste only hands out text; empty means no text to restore."""
+    out = subprocess.run(["pbpaste"], capture_output=True, timeout=5,
+                         check=True).stdout
+    return out.decode("utf-8") if out else None
+
+
+def _mac_clipboard_write(text):
+    subprocess.run(["pbcopy"], input=text.encode("utf-8"), timeout=5,
+                   check=True)
+
+
+def _default_paste_chord():
+    """The chord that pastes into the focused window. Windows terminals
+    (conhost, Windows Terminal, mintty, ConEmu) all take Shift+Insert, but
+    not all take Ctrl+V; Linux terminals need Ctrl+Shift+V."""
+    if sys.platform == "darwin":
+        return "cmd+v"
+    terminal = foreground_window_is_terminal()
+    if sys.platform == "win32":
+        return "shift+insert" if terminal else "ctrl+v"
+    return "ctrl+shift+v" if terminal else "ctrl+v"
+
+
 def _x11_clipboard_read(timeout=2.0):
     """Current X11 CLIPBOARD text as bytes, or None.
 
@@ -905,7 +1040,8 @@ class PynputInjector:
         if self.controller is None:
             from pynput.keyboard import Controller
             self.controller = Controller()
-        if self._needs_clipboard(text) and self._paste_text(text, chord):
+        if ((configured_insert_mode() == "paste" or self._needs_clipboard(text))
+                and self._paste_text(text, chord)):
             return
         delay = TYPE_DELAY
         if delay and TERMINAL_TYPE_DELAY < delay and foreground_window_is_terminal():
@@ -990,51 +1126,69 @@ class PynputInjector:
         return keys
 
     def _paste_text(self, text, chord=None):
-        """Clipboard fallback for untypeable characters: own CLIPBOARD, one
-        synthetic paste chord (ctrl+shift+v in terminals, ctrl+v elsewhere;
+        """Clipboard plus one synthetic paste chord (see _default_paste_chord;
         the streaming mid-hold override wins), then restore the previous
-        contents. False when the clipboard could not be set up — the caller
-        then types what it can."""
+        clipboard text. Used for every dictation in paste mode, and on X11
+        for text with untypeable characters in type mode. False when the
+        clipboard could not be set up — the caller then types instead."""
         try:
-            previous = _x11_clipboard_read()
+            previous = self._clipboard_read()
             # When a restore follows, the transcript only has to survive until
             # then; otherwise it stays pasteable (until the next copy), like
             # wl-copy leaves it on the Wayland backend.
-            _x11_clipboard_own(
-                text.encode("utf-8"),
-                serve_seconds=CLIPBOARD_SETTLE + 2.0 if previous is not None
-                else None)
+            self._clipboard_write(text, transient=previous is not None)
         except Exception as exc:
-            log(f"X11 clipboard paste unavailable: {exc}")
+            log(f"clipboard paste unavailable: {exc}")
             return False
         if chord is None:
-            chord = "ctrl+shift+v" if foreground_window_is_terminal() \
-                else "ctrl+v"
+            chord = _default_paste_chord()
         keys = self._chord_keys(chord)
         for key in keys:
             self.controller.press(key)
         for key in reversed(keys):
             self.controller.release(key)
         # The paste is asynchronous: give the focused app time to fetch the
-        # selection before the clipboard is handed back.
+        # clipboard before it is handed back.
         time.sleep(CLIPBOARD_SETTLE)
         if previous is not None:
             try:
-                # served until another client takes the selection over —
-                # a bounded serve would destroy the owner window on exit and
-                # the "restored" clipboard would vanish shortly after
-                _x11_clipboard_own(previous)
+                self._clipboard_write(previous)
             except Exception as exc:
                 # Only the restore failed — the transcript is already
                 # inserted, so the clipboard simply keeps it.
                 log(f"clipboard restore failed: {exc}")
         return True
 
+    @staticmethod
+    def _clipboard_read():
+        """Previous clipboard contents (opaque per platform), or None."""
+        if os.environ.get("PTT_KEEP_CLIPBOARD") == "1":
+            return None  # nothing to restore: the transcript stays
+        if sys.platform == "win32":
+            return _win_clipboard_read()
+        if sys.platform == "darwin":
+            return _mac_clipboard_read()
+        return _x11_clipboard_read()
+
+    @staticmethod
+    def _clipboard_write(data, transient=False):
+        if sys.platform == "win32":
+            _win_clipboard_write(data, private=True)
+        elif sys.platform == "darwin":
+            _mac_clipboard_write(data)
+        else:
+            # X11: a restored selection must be served until another client
+            # takes it over — a bounded serve would destroy the owner window
+            # and the "restored" clipboard would vanish shortly after.
+            _x11_clipboard_own(
+                data.encode("utf-8") if isinstance(data, str) else data,
+                serve_seconds=CLIPBOARD_SETTLE + 2.0 if transient else None)
+
     def leave_in_clipboard(self, text):
         """Put text on the clipboard without pasting and without restoring —
         the recovery copy for streamed blocks a target could not paste
         mid-hold (see _leave_recovery_transcript)."""
-        _x11_clipboard_own(text.encode("utf-8"))
+        self._clipboard_write(text)
 
     def tap_caps_lock(self):
         """Toggle the caps lock state once.
