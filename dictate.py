@@ -1677,7 +1677,7 @@ class DictationDaemon:
                     pass
             if session.stop.is_set():
                 return
-            segments = self._transcribe(audio, configured_lang())
+            segments = self._transcribe(audio, configured_lang(), restyle=False)
             text = " ".join(s.text.strip() for s in segments).strip()
             with self._preview_lock:
                 if session is self._preview and not session.stop.is_set():
@@ -1693,7 +1693,7 @@ class DictationDaemon:
             except Exception as exc:  # a tick must never kill the dictation
                 log(f"streaming tick failed: {exc}")
 
-    def _transcribe(self, source, lang):
+    def _transcribe(self, source, lang, restyle=True):
         """model.transcribe with the Chinese script and punctuation fixes.
 
         A long dictation can come back all lowercase without punctuation —
@@ -1701,11 +1701,14 @@ class DictationDaemon:
         a given recording. A short punctuated prompt in the dictation's
         language restores the style; the re-decode costs a second pass only
         in that case, and its result is used only if it is punctuated.
+        The live preview passes restyle=False: it holds busy_lock, so a
+        second pass there would delay the final transcription after release
+        for text that is thrown away anyway.
         """
         segments, language = self._transcribe_script(source, lang)
         segs = list(segments)
         prompt = STYLE_PROMPTS.get(language)
-        if not prompt or not _lacks_punctuation(" ".join(s.text for s in segs)):
+        if not restyle or not prompt or not _lacks_punctuation(" ".join(s.text for s in segs)):
             return segs
         log(f"re-decoding with the {language} punctuation prompt "
             f"(pass 1 had none)")

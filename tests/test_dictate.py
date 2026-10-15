@@ -2248,3 +2248,18 @@ def test_transcribe_style_redecode_uses_pinned_language(monkeypatch, tmp_path):
     d._transcribe(wav, "en")
     assert calls[1]["language"] == "en"
     assert calls[1]["initial_prompt"] == dictate.STYLE_PROMPTS["en"]
+
+
+def test_preview_skips_the_punctuation_redecode(monkeypatch, tmp_path):
+    """The preview holds busy_lock; a second pass would delay the final one."""
+    d, rec, wav = make_daemon(monkeypatch, tmp_path)
+    calls = []
+
+    class FakeModel:
+        def transcribe(self, source, **kw):
+            calls.append(kw)
+            return [type("Seg", (), {"text": FLAT})()], type("Info", (), {"language": "de"})()
+
+    d.model = FakeModel()
+    d._transcribe(wav, None, restyle=False)
+    assert len(calls) == 1
