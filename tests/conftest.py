@@ -45,3 +45,10 @@ def _isolated_history(monkeypatch, tmp_path):
     """Dictation tests must never write into the user's real history.json."""
     import dictate
     monkeypatch.setattr(dictate, "HISTORY_PATH", str(tmp_path / "history.json"))
+
+
+@pytest.fixture(autouse=True)
+def _typing_by_default(monkeypatch):
+    """Most insert tests predate paste mode; pin typing, which also keeps
+    every test off the real clipboard (paste tests opt in and stub it)."""
+    monkeypatch.setenv("PTT_INSERT", "type")

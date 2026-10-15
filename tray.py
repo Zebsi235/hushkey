@@ -85,6 +85,11 @@ PTT_KEYS = [
 # (config value, display label) in the Language submenu. "auto" maps to
 # None in the daemon (whisper auto-detect); any other ISO 639-1 code can be
 # set via WHISPER_LANG if the menu is not enough.
+def insert_modes():
+    """(value, label) pairs for the insert-method menu, in the UI language."""
+    return [("paste", S["insert_paste"]), ("type", S["insert_type"])]
+
+
 LANGS = [
     ("auto", "Auto-detect"),
     ("de", "Deutsch"),
@@ -221,6 +226,11 @@ def current_ptt_key():
     return dictate.configured_ptt_key()
 
 
+def current_insert():
+    """'paste' or 'type' — read per dictation by the daemon, like the lang."""
+    return dictate.configured_insert_mode()
+
+
 def current_lang():
     """The effective dictation language — the config file is authoritative
     the moment it is written (the daemon reads it per dictation), so unlike
@@ -267,51 +277,12 @@ def history_label(text):
     return line.replace("&", "&&") if sys.platform == "win32" else line
 
 
-def _windows_copy(text):
-    import ctypes
-    from ctypes import wintypes
-    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
-    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
-    kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
-    kernel32.GlobalLock.restype = wintypes.LPVOID
-    kernel32.GlobalLock.argtypes = (wintypes.HGLOBAL,)
-    kernel32.GlobalUnlock.argtypes = (wintypes.HGLOBAL,)
-    kernel32.GlobalFree.argtypes = (wintypes.HGLOBAL,)
-    user32.SetClipboardData.restype = wintypes.HANDLE
-    user32.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
-    data = text.encode("utf-16-le") + b"\0\0"
-    for _ in range(10):  # another app may hold the clipboard for a moment
-        if user32.OpenClipboard(None):
-            break
-        time.sleep(0.05)
-    else:
-        raise OSError("the clipboard is busy")
-    try:
-        user32.EmptyClipboard()
-        handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
-        if not handle:
-            raise OSError("GlobalAlloc failed")
-        ptr = kernel32.GlobalLock(handle)
-        if not ptr:
-            kernel32.GlobalFree(handle)
-            raise OSError("GlobalLock failed")
-        ctypes.memmove(ptr, data, len(data))
-        kernel32.GlobalUnlock(handle)
-        if not user32.SetClipboardData(13, handle):  # CF_UNICODETEXT
-            kernel32.GlobalFree(handle)
-            raise OSError("SetClipboardData failed")
-        # on success the clipboard owns the memory — do not free it
-    finally:
-        user32.CloseClipboard()
-
-
 def copy_to_clipboard(text):
     """Put text on the system clipboard; raises OSError/RuntimeError on failure."""
     if sys.platform == "win32":
-        _windows_copy(text)
+        dictate._win_clipboard_write(text)
     elif sys.platform == "darwin":
-        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True,
-                       timeout=5)
+        dictate._mac_clipboard_write(text)  # pins a UTF-8 locale
     elif os.environ.get("WAYLAND_DISPLAY"):
         # wl-copy forks a background owner and returns right away
         subprocess.run(["wl-copy", "--type", "text/plain"],
@@ -599,6 +570,9 @@ _STRINGS = {
         "lang_menu": "Language",
         "lang_switching_title": "hushkey language",
         "lang_switching": "language is now {lang} — active on the next dictation",
+        "insert_menu": "Insert method",
+        "insert_paste": "Paste (clipboard)",
+        "insert_type": "Type (keystrokes)",
         "history_menu": "Recent dictations",
         "history_copied_title": "hushkey",
         "history_copied": "copied — paste with {paste}",
@@ -637,6 +611,9 @@ _STRINGS = {
         "lang_menu": "Sprache",
         "lang_switching_title": "hushkey Sprache",
         "lang_switching": "Sprache ist jetzt {lang} — ab dem nächsten Diktat aktiv",
+        "insert_menu": "Einfügemethode",
+        "insert_paste": "Einfügen (Zwischenablage)",
+        "insert_type": "Tippen (Tastenanschläge)",
         "history_menu": "Letzte Diktate",
         "history_copied_title": "hushkey",
         "history_copied": "kopiert — mit {paste} einfügen",
@@ -985,6 +962,7 @@ class Tray:
             item(S["model_menu"], self._model_menu()),
             item(S["key_menu"], self._key_menu()),
             item(S["lang_menu"], self._lang_menu()),
+            item(S["insert_menu"], self._insert_menu()),
             item(S["history_menu"], self._history_menu(),
                  visible=lambda _m: bool(dictate.read_history())),
             pystray.Menu.SEPARATOR,
@@ -1010,6 +988,27 @@ class Tray:
     def _lang_menu(self):
         return self._choice_menu(list(LANGS),
                                  lambda: current_lang(), self._set_lang)
+
+    def _insert_menu(self):
+        return self._choice_menu(insert_modes(),
+                                 lambda: current_insert(), self._set_insert)
+
+    def _set_insert(self, mode):
+        """No restart: the daemon reads the mode per dictation. An env var
+        would mask the choice, so it goes like WHISPER_LANG does."""
+        if mode == current_insert():
+            return
+        had_env = "PTT_INSERT" in os.environ
+        clear_env_var("PTT_INSERT")
+        try:
+            write_config(insert=mode)
+        except OSError as exc:
+            dictate.log(f"tray: insert method not saved: {exc}")
+            return
+        if had_env:
+            self.daemon.restart()
+        else:
+            self.icon.update_menu()
 
     def _history_menu(self):
         """Last dictations, newest first; clicking one copies it. A callable
