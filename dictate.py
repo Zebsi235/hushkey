@@ -875,9 +875,13 @@ def _win_clipboard_write(text, private=False):
 # pbcopy/pbpaste pick their encoding from the locale, and a LaunchAgent has
 # none: without this, UTF-8 "Grüße" would be read as MacRoman ("GrÃ¼ÃŸe").
 _MAC_UTF8_ENV = {"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
-# Clipboard types pbpaste flattens to a name or nothing — restoring that text
-# would replace a copied file or image, so such a clipboard is left alone.
-_MAC_NON_TEXT_TYPES = ("furl", "PNGf", "TIFF", "JPEG", "GIFf", "PDF ")
+# A copied file flattens to its name in pbpaste, an image to nothing —
+# restoring that would replace the file or image, so such a clipboard is left
+# alone. Office/iWork add PDF/image renditions to copied *text*, though, so
+# images only count when no text type is present.
+_MAC_FILE_TYPES = ("furl",)
+_MAC_IMAGE_TYPES = ("PNGf", "TIFF", "JPEG", "GIFf", "PDF ")
+_MAC_TEXT_TYPES = ("utf8", "ut16", "string")
 
 
 def _mac_clipboard_read():
@@ -888,7 +892,10 @@ def _mac_clipboard_read():
     info = subprocess.run(["osascript", "-e", "clipboard info"],
                           capture_output=True, timeout=5, check=True,
                           env=env).stdout.decode("utf-8", "replace")
-    if any(kind in info for kind in _MAC_NON_TEXT_TYPES):
+    if any(kind in info for kind in _MAC_FILE_TYPES):
+        return None
+    if (any(kind in info for kind in _MAC_IMAGE_TYPES)
+            and not any(kind in info for kind in _MAC_TEXT_TYPES)):
         return None
     out = subprocess.run(["pbpaste"], capture_output=True, timeout=5,
                          check=True, env=env).stdout
@@ -908,6 +915,28 @@ _OFFERS = {}         # hwnd -> _WinClipboardOffer
 _OFFER_WNDPROC = []  # the registered callback; must outlive every window
 
 
+def _win_foreground_window():
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    return user32.GetForegroundWindow()
+
+
+def _win_window_pid(hwnd):
+    """The process owning a window, or None."""
+    if not hwnd:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND,
+                                                ctypes.POINTER(wintypes.DWORD))
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value or None
+
+
 class _WinClipboardOffer:
     """The transcript on the Windows clipboard via delayed rendering.
 
@@ -917,16 +946,21 @@ class _WinClipboardOffer:
     Remote Desktop session can outlast, which would paste the restored
     contents (a copied password, say) instead of the dictation.
 
-    Only a fetch after arm() counts: a clipboard monitor that reads right
-    away caches the data, the paste then triggers no render, and the wait
-    times out — the safe outcome, no restore. Closing an unfetched offer
-    renders the text for good (WM_RENDERALLFORMATS), so it stays pasteable.
+    Only a fetch after arm() by the paste target counts — the process owning
+    the foreground window when the chord is sent. A clipboard monitor reading
+    at about the same time caches the data, the target's paste then triggers
+    no render, and the wait times out: the safe outcome, no restore. Readers
+    that open the clipboard without a window cannot be attributed and count
+    as the target: monitors need a window to hear about clipboard changes
+    at all, and refusing them would stall every such paste for the timeout. Closing an unfetched offer renders the text
+    for good (WM_RENDERALLFORMATS), so it stays pasteable.
     """
 
     def __init__(self, text):
         self.data = text.encode("utf-16-le") + bytes(2)
         self.fetched = threading.Event()
         self.armed = False
+        self.target_pid = None
         self.hwnd = None
         self._ready = threading.Event()
         self._error = None
@@ -938,6 +972,7 @@ class _WinClipboardOffer:
             raise self._error
 
     def arm(self):
+        self.target_pid = _win_window_pid(_win_foreground_window())
         self.armed = True
 
     def wait(self, timeout):
@@ -971,7 +1006,9 @@ class _WinClipboardOffer:
         if msg == _WM_RENDERFORMAT:
             if offer is not None and wparam == _CF_UNICODETEXT:
                 offer._render()
-                if offer.armed:
+                # the reader holds the clipboard open right now
+                reader = _win_window_pid(user32.GetOpenClipboardWindow())
+                if offer.armed and reader in (None, offer.target_pid):
                     offer.fetched.set()
             return 0
         if msg == _WM_RENDERALLFORMATS:
@@ -1005,6 +1042,7 @@ class _WinClipboardOffer:
             user32.DefWindowProcW.argtypes = (wintypes.HWND, wintypes.UINT,
                                               wintypes.WPARAM, wintypes.LPARAM)
             user32.GetClipboardOwner.restype = wintypes.HWND
+            user32.GetOpenClipboardWindow.restype = wintypes.HWND
             user32.CreateWindowExW.restype = wintypes.HWND
             user32.CreateWindowExW.argtypes = (
                 wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
