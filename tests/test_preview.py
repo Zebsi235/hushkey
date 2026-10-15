@@ -37,7 +37,8 @@ def preview(monkeypatch, tmp_path):
 def test_preview_only_publishes_recent_text(preview, monkeypatch):
     daemon, session, wav = preview
     seen = []
-    def transcribe(audio, lang):
+    def transcribe(audio, lang, restyle=True):
+        assert restyle is False  # never a second pass under busy_lock
         seen.append(len(audio))
         return [SimpleNamespace(text='English preview. 中文。')]
     monkeypatch.setattr(daemon, '_transcribe', transcribe)
@@ -53,7 +54,7 @@ def test_preview_only_publishes_recent_text(preview, monkeypatch):
 
 def test_late_preview_cannot_overwrite_released_or_new_recording(preview, monkeypatch):
     daemon, session, wav = preview
-    def transcribe(*_):
+    def transcribe(*_, **__):
         session.stop.set()
         daemon._preview = dictate._StreamSession()
         dictate.write_state('recording')
@@ -67,7 +68,7 @@ def test_late_preview_cannot_overwrite_released_or_new_recording(preview, monkey
 
 def test_preview_skips_when_final_inference_or_insertion_busy(preview, monkeypatch):
     daemon, session, wav = preview
-    monkeypatch.setattr(daemon, '_transcribe', lambda *_: pytest.fail('must skip'))
+    monkeypatch.setattr(daemon, '_transcribe', lambda *_, **__: pytest.fail('must skip'))
     with daemon.busy_lock:
         daemon._preview_tick(session)
     assert wav.exists()  # no snapshot was taken
@@ -75,7 +76,7 @@ def test_preview_skips_when_final_inference_or_insertion_busy(preview, monkeypat
 
 def test_preview_exception_cleans_snapshot_and_releases_lock(preview, monkeypatch):
     daemon, session, wav = preview
-    monkeypatch.setattr(daemon, '_transcribe', lambda *_: (_ for _ in ()).throw(ValueError('decode')))
+    monkeypatch.setattr(daemon, '_transcribe', lambda *_, **__: (_ for _ in ()).throw(ValueError('decode')))
     with pytest.raises(ValueError):
         daemon._preview_tick(session)
     assert not wav.exists()
@@ -139,7 +140,7 @@ def test_release_during_preview_clears_text_and_inserts_full_recording_once(prev
             completed.set()
     monkeypatch.setattr(dictate, 'write_state', publish)
     inputs, outputs = [], []
-    def transcribe(source, lang):
+    def transcribe(source, lang, restyle=True):
         inputs.append(source)
         if isinstance(source, np.ndarray):
             entered.set()

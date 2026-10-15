@@ -301,6 +301,29 @@ def _contains_cjk(text):
                for ch in text)
 
 
+# A short punctuated sentence per language: the style whisper should keep.
+# Used only to re-decode a dictation that came back without punctuation.
+STYLE_PROMPTS = {
+    "de": "Hallo, wie geht es dir? Gut, danke.",
+    "en": "Hello, how are you? Fine, thanks.",
+    "fr": "Bonjour, comment ça va ? Bien, merci.",
+    "es": "Hola, ¿qué tal? Bien, gracias.",
+    "it": "Ciao, come stai? Bene, grazie.",
+    "nl": "Hallo, hoe gaat het? Goed, dank je.",
+    "pt": "Olá, tudo bem? Tudo, obrigado.",
+    "pl": "Cześć, jak się masz? Dobrze, dziękuję.",
+}
+_PUNCTUATION = set(".,;:?!")
+
+
+def _lacks_punctuation(text, min_words=20):
+    """True for a long transcript without a single punctuation mark — whisper
+    sometimes falls into that style for a whole dictation (seen on a 189 s
+    German recording via whisper.cpp: all lowercase, no punctuation)."""
+    return (len(text.split()) >= min_words
+            and not any(ch in _PUNCTUATION for ch in text))
+
+
 def configured_lang():
     """Dictation language: WHISPER_LANG env wins (documented), then the tray's
     config file, else 'de'. Returns None for auto-detect — spelled 'auto' in
@@ -2099,7 +2122,7 @@ class DictationDaemon:
                     pass
             if session.stop.is_set():
                 return
-            segments = self._transcribe(audio, configured_lang())
+            segments = self._transcribe(audio, configured_lang(), restyle=False)
             text = " ".join(s.text.strip() for s in segments).strip()
             with self._preview_lock:
                 if session is self._preview and not session.stop.is_set():
@@ -2115,8 +2138,36 @@ class DictationDaemon:
             except Exception as exc:  # a tick must never kill the dictation
                 log(f"streaming tick failed: {exc}")
 
-    def _transcribe(self, source, lang):
-        """model.transcribe with the Chinese script fix applied.
+    def _transcribe(self, source, lang, restyle=True):
+        """model.transcribe with the Chinese script and punctuation fixes.
+
+        A long dictation can come back all lowercase without punctuation —
+        whisper picked an unpunctuated style, sometimes deterministically for
+        a given recording. A short punctuated prompt in the dictation's
+        language restores the style; the re-decode costs a second pass only
+        in that case, and its result is used only if it is punctuated.
+        The live preview passes restyle=False: it holds busy_lock, so a
+        second pass there would delay the final transcription after release
+        for text that is thrown away anyway.
+        """
+        segments, language = self._transcribe_script(source, lang)
+        segs = list(segments)
+        prompt = STYLE_PROMPTS.get(language)
+        if not restyle or not prompt or not _lacks_punctuation(" ".join(s.text for s in segs)):
+            return segs
+        log(f"re-decoding with the {language} punctuation prompt "
+            f"(pass 1 had none)")
+        redo, _info = self.model.transcribe(
+            source, language=language, vad_filter=True, beam_size=5,
+            initial_prompt=prompt)
+        redo = list(redo)
+        if any(ch in _PUNCTUATION for s in redo for ch in s.text):
+            return redo
+        return segs
+
+    def _transcribe_script(self, source, lang):
+        """model.transcribe with the Chinese script fix applied; returns the
+        segments and the language they are in (None when unknown).
 
         Whisper's multilingual models mix Traditional characters into
         Mandarin output at random; a Simplified initial_prompt pins the
@@ -2143,27 +2194,27 @@ class DictationDaemon:
                 if lang == "zh" else {}
             segments, _info = self.model.transcribe(
                 source, language=lang, vad_filter=True, beam_size=5, **kwargs)
-            return segments
+            return segments, lang
         segments, info = self.model.transcribe(
             source, language=None, vad_filter=True, beam_size=5)
-        if not prompt:
-            return segments
         detected = getattr(info, "language", None)
+        if not prompt:
+            return segments, detected
         if detected in ("ja", "yue"):
-            return segments  # shares the characters with Mandarin
+            return segments, detected  # shares the characters with Mandarin
         if detected != "zh":
             # The guess on Mandarin is a coin flip, so only the text tells
             # whether Chinese was actually heard. When the guess already is
             # zh, the pass-1 text is irrelevant — don't pay for decoding it.
             segs = list(segments)
             if not _contains_cjk("".join(s.text for s in segs)):
-                return segs
+                return segs, detected
         log(f"re-decoding with the Simplified prompt "
             f"(pass-1 guess: {detected!r})")
         segments, _info = self.model.transcribe(
             source, language="zh", vad_filter=True, beam_size=5,
             initial_prompt=prompt, temperature=0.0)
-        return segments
+        return segments, "zh"
 
     def _stream_tick(self, session):
         wav = self.recorder.snapshot_wav()
