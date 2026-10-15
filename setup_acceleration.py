@@ -23,7 +23,7 @@ import zipfile
 
 import acceleration
 
-VERSION = 'v0.10.4'
+VERSION = 'v0.10.5'
 RELEASE_URL = f'https://github.com/aignermax/hushkey/releases/download/{VERSION}'
 
 
