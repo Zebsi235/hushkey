@@ -66,16 +66,14 @@ Config via environment:
                    instead of one big paste on release (default: 0)
   PTT_STREAM_INTERVAL  seconds between streaming ticks (default: 3.0)
   PTT_INSERT       how a dictation enters the focused window: paste
-                   (default: clipboard plus one paste chord, then the previous
-                   clipboard text is restored) or type (one keystroke per
-                   character). Overrides the tray's "Insert method" menu.
+                   (default: clipboard plus one paste chord) or type (one
+                   keystroke per character). On Windows the transcript stays
+                   in the clipboard for asynchronous paste targets; elsewhere
+                   previous text is restored. Overrides "Insert method".
                    Wayland always pastes; X11 terminals are always typed into
                    (xterm/urxvt have no Ctrl+Shift+V paste).
-  PTT_PASTE_TIMEOUT  Windows: seconds to wait for the target app to fetch a
-                   pasted dictation before the previous clipboard is given up
-                   rather than restored (default: 5)
   PTT_KEEP_CLIPBOARD  1 = leave the transcript in the clipboard instead of
-                   restoring the previous contents
+                   restoring the previous contents (always enabled on Windows)
   PTT_CLIPBOARD_SETTLE  Wayland: seconds to wait before restoring the previous
                    clipboard (default: 0.4); raise it if a slow app ends up
                    pasting the restored value instead of the transcript
@@ -119,7 +117,7 @@ def _state_dir():
 
 STATE_DIR = _state_dir()
 
-VERSION = "0.10.5"
+VERSION = "0.10.6"
 
 
 def audio_debug_machine_id():
@@ -830,9 +828,9 @@ def _win_clipboard_api():
     return ctypes, user32, kernel32
 
 
-def _win_open_clipboard(user32):
+def _win_open_clipboard(user32, hwnd=None):
     for _ in range(10):  # another app may hold the clipboard for a moment
-        if user32.OpenClipboard(None):
+        if user32.OpenClipboard(hwnd):
             return
         time.sleep(0.05)
     raise OSError("the clipboard is busy")
@@ -863,6 +861,20 @@ def _win_clipboard_write(text, private=False):
     Win+V clipboard history, the cloud clipboard and clipboard monitors —
     for dictations passing through on their way into a window."""
     ctypes, user32, kernel32 = _win_clipboard_api()
+    from ctypes import wintypes
+    # EmptyClipboard needs an actual owner window. With OpenClipboard(NULL)
+    # Windows assigns no owner, making subsequent clipboard writes unreliable.
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.CreateWindowExW.argtypes = (
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND,
+        wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID)
+    user32.OpenClipboard.argtypes = (wintypes.HWND,)
+    user32.DestroyWindow.argtypes = (wintypes.HWND,)
+    hwnd = user32.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0,
+                                  wintypes.HWND(-3), None, None, None)
+    if not hwnd:
+        raise OSError("clipboard owner window could not be created")
 
     def put(fmt, data):
         handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
@@ -879,20 +891,24 @@ def _win_clipboard_write(text, private=False):
             raise OSError("SetClipboardData failed")
         # on success the clipboard owns the memory — do not free it
 
-    _win_open_clipboard(user32)
     try:
-        user32.EmptyClipboard()
-        put(_CF_UNICODETEXT, text.encode("utf-16-le") + bytes(2))
-        if private:
-            zero = (0).to_bytes(4, "little")
-            for name in ("ExcludeClipboardContentFromMonitorProcessing",
-                         "CanIncludeInClipboardHistory",
-                         "CanUploadToCloudClipboard"):
-                fmt = user32.RegisterClipboardFormatW(name)
-                if fmt:
-                    put(fmt, zero)
+        _win_open_clipboard(user32, hwnd)
+        try:
+            if not user32.EmptyClipboard():
+                raise OSError("EmptyClipboard failed")
+            put(_CF_UNICODETEXT, text.encode("utf-16-le") + bytes(2))
+            if private:
+                zero = (0).to_bytes(4, "little")
+                for name in ("ExcludeClipboardContentFromMonitorProcessing",
+                             "CanIncludeInClipboardHistory",
+                             "CanUploadToCloudClipboard"):
+                    fmt = user32.RegisterClipboardFormatW(name)
+                    if fmt:
+                        put(fmt, zero)
+        finally:
+            user32.CloseClipboard()
     finally:
-        user32.CloseClipboard()
+        user32.DestroyWindow(hwnd)
 
 
 # pbcopy/pbpaste pick their encoding from the locale, and a LaunchAgent has
@@ -930,224 +946,31 @@ def _mac_clipboard_write(text):
                    check=True, env={**os.environ, **_MAC_UTF8_ENV})
 
 
-PASTE_FETCH_TIMEOUT = _env_float("PTT_PASTE_TIMEOUT", 5.0)
-_WM_DESTROY, _WM_CLOSE = 0x0002, 0x0010
-_WM_RENDERFORMAT, _WM_RENDERALLFORMATS = 0x0305, 0x0306
-_OFFER_CLASS = "hushkey-clipboard-offer"
-_OFFERS = {}         # hwnd -> _WinClipboardOffer
-_OFFER_WNDPROC = []  # the registered callback; must outlive every window
-
-
-def _win_foreground_window():
-    import ctypes
-    from ctypes import wintypes
-    user32 = ctypes.windll.user32
-    user32.GetForegroundWindow.restype = wintypes.HWND
-    return user32.GetForegroundWindow()
-
-
-def _win_window_pid(hwnd):
-    """The process owning a window, or None."""
-    if not hwnd:
-        return None
-    import ctypes
-    from ctypes import wintypes
-    user32 = ctypes.windll.user32
-    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND,
-                                                ctypes.POINTER(wintypes.DWORD))
-    pid = wintypes.DWORD()
-    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return pid.value or None
-
-
 class _WinClipboardOffer:
-    """The transcript on the Windows clipboard via delayed rendering.
+    """Publish real text before the chord and leave it available for late reads.
 
-    The text is produced only when an app asks for it (WM_RENDERFORMAT), so
-    the daemon learns *when* the paste target fetched it and restores the
-    previous clipboard only then — never on a timer that a busy app or a
-    Remote Desktop session can outlast, which would paste the restored
-    contents (a copied password, say) instead of the dictation.
-
-    Only a fetch after arm() by the paste target counts — the process owning
-    the foreground window when the chord is sent. A clipboard monitor reading
-    at about the same time caches the data, the target's paste then triggers
-    no render, and the wait times out: the safe outcome, no restore. Readers
-    that open the clipboard without a window cannot be attributed and count
-    as the target: monitors need a window to hear about clipboard changes
-    at all, and refusing them would stall every such paste for the timeout. Closing an unfetched offer renders the text
-    for good (WM_RENDERALLFORMATS), so it stays pasteable.
+    WM_RENDERFORMAT is a request for data, not an acknowledgement of a paste.
+    Even the target process may inspect the clipboard before reading it again
+    for insertion, so restoring old text after that event is unsafe.
     """
 
     def __init__(self, text):
-        self.data = text.encode("utf-16-le") + bytes(2)
-        self.fetched = threading.Event()
-        self.armed = False
-        self.target_pid = None
-        self.hwnd = None
-        self._ready = threading.Event()
-        self._error = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        if not self._ready.wait(5):
-            raise OSError("clipboard owner window did not start")
-        if self._error is not None:
-            raise self._error
+        _win_clipboard_write(text, private=True)
+        # Never send a paste chord unless the new text can actually be read.
+        for _ in range(10):
+            if _win_clipboard_read() == text:
+                return
+            time.sleep(0.01)
+        raise OSError("clipboard did not retain the dictation")
 
     def arm(self):
-        self.target_pid = _win_window_pid(_win_foreground_window())
-        self.armed = True
+        pass
 
     def wait(self, timeout):
-        return self.fetched.wait(timeout)
+        return False  # Windows has no reliable paste-completion acknowledgement.
 
     def close(self):
-        if self.hwnd:
-            import ctypes
-            ctypes.windll.user32.PostMessageW(self.hwnd, _WM_CLOSE, 0, 0)
-        self._thread.join(5)
-
-    def _render(self):
-        ctypes, user32, kernel32 = _win_clipboard_api()
-        handle = kernel32.GlobalAlloc(0x0002, len(self.data))  # GMEM_MOVEABLE
-        if not handle:
-            return
-        ptr = kernel32.GlobalLock(handle)
-        if not ptr:
-            kernel32.GlobalFree(handle)
-            return
-        ctypes.memmove(ptr, self.data, len(self.data))
-        kernel32.GlobalUnlock(handle)
-        if not user32.SetClipboardData(_CF_UNICODETEXT, handle):
-            kernel32.GlobalFree(handle)
-
-    @staticmethod
-    def _wndproc(hwnd, msg, wparam, lparam):
-        import ctypes
-        user32 = ctypes.windll.user32
-        offer = _OFFERS.get(hwnd)
-        if msg == _WM_RENDERFORMAT:
-            if offer is not None and wparam == _CF_UNICODETEXT:
-                offer._render()
-                # the reader holds the clipboard open right now
-                reader = _win_window_pid(user32.GetOpenClipboardWindow())
-                if offer.armed and reader in (None, offer.target_pid):
-                    offer.fetched.set()
-            return 0
-        if msg == _WM_RENDERALLFORMATS:
-            # closing while still the owner: render for good, so the
-            # transcript stays pasteable after the window is gone. During
-            # DestroyWindow the system already holds the clipboard open for
-            # us (OpenClipboard fails with ERROR_ACCESS_DENIED, measured on
-            # Windows 11) — then render directly.
-            if offer is None or user32.GetClipboardOwner() != hwnd:
-                return 0
-            if user32.OpenClipboard(hwnd):
-                try:
-                    offer._render()
-                finally:
-                    user32.CloseClipboard()
-            else:
-                offer._render()
-            return 0
-        if msg == _WM_DESTROY:
-            user32.PostQuitMessage(0)
-            return 0
-        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-    def _run(self):
-        try:
-            import ctypes
-            from ctypes import wintypes
-            ctypes_, user32, kernel32 = _win_clipboard_api()
-            lresult = ctypes.c_ssize_t
-            user32.DefWindowProcW.restype = lresult
-            user32.DefWindowProcW.argtypes = (wintypes.HWND, wintypes.UINT,
-                                              wintypes.WPARAM, wintypes.LPARAM)
-            user32.GetClipboardOwner.restype = wintypes.HWND
-            user32.GetOpenClipboardWindow.restype = wintypes.HWND
-            user32.CreateWindowExW.restype = wintypes.HWND
-            user32.CreateWindowExW.argtypes = (
-                wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
-                wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                ctypes.c_int, wintypes.HWND, wintypes.HMENU,
-                wintypes.HINSTANCE, wintypes.LPVOID)
-            user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT,
-                                            wintypes.WPARAM, wintypes.LPARAM)
-            user32.OpenClipboard.argtypes = (wintypes.HWND,)
-            kernel32.GetModuleHandleW.restype = wintypes.HMODULE
-            hinstance = kernel32.GetModuleHandleW(None)
-            if not _OFFER_WNDPROC:
-                wndproc_type = ctypes.WINFUNCTYPE(
-                    lresult, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
-                    wintypes.LPARAM)
-
-                class WNDCLASSW(ctypes.Structure):
-                    _fields_ = [("style", wintypes.UINT),
-                                ("lpfnWndProc", wndproc_type),
-                                ("cbClsExtra", ctypes.c_int),
-                                ("cbWndExtra", ctypes.c_int),
-                                ("hInstance", wintypes.HINSTANCE),
-                                ("hIcon", wintypes.HICON),
-                                ("hCursor", wintypes.HANDLE),
-                                ("hbrBackground", wintypes.HBRUSH),
-                                ("lpszMenuName", wintypes.LPCWSTR),
-                                ("lpszClassName", wintypes.LPCWSTR)]
-
-                callback = wndproc_type(
-                    lambda h, m, w, l: _WinClipboardOffer._wndproc(h, m, w, l))
-                wc = WNDCLASSW(lpfnWndProc=callback, hInstance=hinstance,
-                               lpszClassName=_OFFER_CLASS)
-                if not user32.RegisterClassW(ctypes.byref(wc)):
-                    raise OSError("RegisterClassW failed")
-                _OFFER_WNDPROC.append(callback)
-            hwnd = user32.CreateWindowExW(0, _OFFER_CLASS, None, 0, 0, 0, 0, 0,
-                                          wintypes.HWND(-3),  # HWND_MESSAGE
-                                          None, hinstance, None)
-            if not hwnd:
-                raise OSError("CreateWindowExW failed")
-            self.hwnd = hwnd
-            _OFFERS[hwnd] = self
-            for _ in range(10):
-                if user32.OpenClipboard(hwnd):
-                    break
-                time.sleep(0.05)
-            else:
-                user32.DestroyWindow(hwnd)
-                raise OSError("the clipboard is busy")
-            try:
-                user32.EmptyClipboard()
-                user32.SetClipboardData(_CF_UNICODETEXT, None)  # delayed
-                zero = (0).to_bytes(4, "little")
-                for name in ("ExcludeClipboardContentFromMonitorProcessing",
-                             "CanIncludeInClipboardHistory",
-                             "CanUploadToCloudClipboard"):
-                    fmt = user32.RegisterClipboardFormatW(name)
-                    if not fmt:
-                        continue
-                    handle = kernel32.GlobalAlloc(0x0002, 4)
-                    ptr = kernel32.GlobalLock(handle) if handle else None
-                    if ptr:
-                        ctypes.memmove(ptr, zero, 4)
-                        kernel32.GlobalUnlock(handle)
-                        if not user32.SetClipboardData(fmt, handle):
-                            kernel32.GlobalFree(handle)
-                    elif handle:
-                        kernel32.GlobalFree(handle)
-            finally:
-                user32.CloseClipboard()
-        except Exception as exc:
-            self._error = exc if isinstance(exc, OSError) else OSError(str(exc))
-            self._ready.set()
-            return
-        self._ready.set()
-        msg = wintypes.MSG()
-        try:
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
-        finally:
-            _OFFERS.pop(self.hwnd, None)
+        pass  # Windows owns the published memory; no owner thread is needed.
 
 
 class _TimedOffer:
@@ -1426,12 +1249,13 @@ class PynputInjector:
     def _paste_text(self, text, chord=None):
         """Clipboard plus one synthetic paste chord (see _default_paste_chord;
         the streaming mid-hold override wins), then restore the previous
-        clipboard text once the target has fetched the dictation. Used for
+        clipboard text on non-Windows platforms. Windows keeps the transcript
+        because clipboard reads do not acknowledge paste completion. Used for
         every dictation in paste mode, and on X11 for text with untypeable
         characters in type mode. False when the clipboard could not be set
         up — the caller then types instead."""
         try:
-            previous = self._clipboard_read()
+            previous = None if sys.platform == "win32" else self._clipboard_read()
             # When a restore follows, the transcript only has to survive until
             # then; otherwise it stays pasteable (until the next copy), like
             # wl-copy leaves it on the Wayland backend.
@@ -1448,14 +1272,14 @@ class PynputInjector:
                 self.controller.press(key)
             for key in reversed(keys):
                 self.controller.release(key)
-            fetched = offer.wait(PASTE_FETCH_TIMEOUT)
             if previous is None:
                 return True
+            fetched = offer.wait(5.0)
             if not fetched:
                 # Restoring now could let a late fetch paste the previous
                 # contents instead of the dictation — give them up instead.
                 log(f"paste target did not fetch the dictation within "
-                    f"{PASTE_FETCH_TIMEOUT:g}s; previous clipboard not restored")
+                    "the timeout; previous clipboard not restored")
                 return True
             try:
                 self._clipboard_write(previous)

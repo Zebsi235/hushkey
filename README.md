@@ -263,6 +263,16 @@ How to set them:
   (`EnvironmentVariables` section is prepared), then
   `launchctl kickstart -k gui/$(id -u)/com.whisper-ptt`.
 
+### Windows paste mode
+
+Hushkey writes and verifies the transcript before sending the paste shortcut.
+The transcript stays in the clipboard until your next copy. Windows clipboard
+reads do not confirm that an application has finished pasting, so restoring the
+old contents can insert stale text in applications that read asynchronously or
+more than once. Temporary dictation text remains excluded from Windows clipboard
+history and cloud synchronization. If writing or verifying the clipboard fails,
+Hushkey falls back to typing instead of pasting stale contents.
+
 ### The Wayland paste chord
 
 On Wayland the text arrives via the clipboard plus one synthetic paste
