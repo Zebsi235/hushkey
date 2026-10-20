@@ -38,7 +38,7 @@ def test_iss_uninstalls_and_verifies_properly():
 
 
 def test_iss_lets_setup_children_follow_cache_symlinks():
-    """install.ps1 inherits Setup's RedirectionGuard; huggingface_hub's cache symlinks then fail with WinError 448."""
+    """Setup's RedirectionGuard reaches install.ps1; cached-model symlinks then fail (WinError 448)."""
     text = ISS.read_text(encoding="utf-8")
     assert re.search(r"^RedirectionGuard=no$", text, flags=re.M)
 
