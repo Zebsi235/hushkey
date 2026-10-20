@@ -38,9 +38,11 @@ def test_iss_uninstalls_and_verifies_properly():
 
 
 def test_iss_lets_setup_children_follow_cache_symlinks():
-    """Setup's RedirectionGuard reaches install.ps1; cached-model symlinks then fail (WinError 448)."""
+    """RedirectionGuard must stay off — install.ps1's Python children inherit it and can't follow cached-model symlinks (WinError 448)."""
     text = ISS.read_text(encoding="utf-8")
-    assert re.search(r"^RedirectionGuard=no$", text, flags=re.M)
+    setup = re.search(r"^\[Setup\]$(.*?)(?=^\[)", text, flags=re.M | re.S).group(1)
+    assert re.findall(r"^\s*RedirectionGuard\s*=\s*(\w+)", setup, flags=re.M | re.I) == ["no"]
+    assert "EncodeVer(6,7,0)" in text    # older ISCC rejects the directive
 
 
 def test_deb_payload_matches_install_sh_expectations():
