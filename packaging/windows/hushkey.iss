@@ -16,6 +16,11 @@ AppPublisher=aignermax
 AppPublisherURL=https://github.com/aignermax/hushkey
 DefaultDirName={localappdata}\Programs\whisper-ptt
 PrivilegesRequired=lowest
+; Setup's RedirectionGuard reaches install.ps1 and its Python children: they
+; then cannot open the symlinks huggingface_hub keeps cached models behind
+; (WinError 448). A per-user install into the user's own profile gains nothing
+; from the guard.
+RedirectionGuard=no
 ArchitecturesAllowed=x64compatible
 OutputDir=dist
 OutputBaseFilename=hushkey-setup-{#MyAppVersion}

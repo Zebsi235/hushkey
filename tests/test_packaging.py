@@ -37,6 +37,12 @@ def test_iss_uninstalls_and_verifies_properly():
     assert "SHA256" in text              # python.org fallback is checksum-pinned
 
 
+def test_iss_lets_setup_children_follow_cache_symlinks():
+    """install.ps1 inherits Setup's RedirectionGuard; huggingface_hub's cache symlinks then fail with WinError 448."""
+    text = ISS.read_text(encoding="utf-8")
+    assert re.search(r"^RedirectionGuard=no$", text, flags=re.M)
+
+
 def test_deb_payload_matches_install_sh_expectations():
     """install.sh reads systemd/*.service.in and udev/*.rules — the deb must ship them."""
     script = (DEB / "build-deb.sh").read_text(encoding="utf-8")
